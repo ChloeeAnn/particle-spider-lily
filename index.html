@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>点彩花</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #panel {
+    position: fixed; left: 16px; right: 16px; bottom: 16px;
+    display: none; align-items: center; gap: 12px;
+    color: #99a; font: 12px/1 -apple-system, "PingFang SC", sans-serif;
+  }
+  #panel.on { display: flex; }
+  #panel input { flex: 1; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="panel">
+  <span id="lbl">0.00</span>
+  <input id="scrub" type="range" min="0" max="1" step="0.001" value="0">
+  <span>空格 暂停 · D 隐藏</span>
+</div>
+<script>
+// ===== 可调参数 =====
+let CYCLE = 11;                         // 一轮循环秒数：按花瓣、花蕊完整舒展需要的时间自动算（见下面 CLOSE_T）
+const COLORS = {
+  wiltPetal:  [72, 60, 116],            // 枯萎时花瓣（暗灰紫）
+  wiltStamen: [70, 62, 102],            // 枯萎时花蕊
+  wiltStem:   [104, 98, 80],            // 枯萎时花葶（压暗，和盛开对比更明显）
+  petal:      [[128, 156, 238], [110, 105, 255], [150, 80, 235]],   // 盛开花瓣 根→尖：冰蓝 → 蓝紫 → 紫（根部压暗，花心不发白）
+  stamen:     [150, 142, 240],          // 花蕊：比花瓣暗一些的发光细丝，让花瓣当主角
+  antherDim:  [175, 170, 248],          // 普通花药：每根花蕊末端一个小小的线头
+  anther:     [225, 225, 255],          // 花药（发白光）
+  stem:       [66, 108, 100],           // 花葶：低饱和、偏暗的冷青绿（比真实植物冷，比纯蓝绿）
+  halo:       [112, 120, 162],          // 光环：偏灰偏暗的冷雾紫蓝，和花拉开区分
+  haloSpark:  [168, 178, 212],
+  soil:       [205, 205, 215],
+};
+
+// ===== 画布 =====
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const glowA = document.createElement('canvas'), gA = glowA.getContext('2d');
+const glowB = document.createElement('canvas'), gB = glowB.getContext('2d');
+let W, H, DPR, U, CX, GY;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = cv.width = Math.round(innerWidth * DPR);
+  H = cv.height = Math.round(innerHeight * DPR);
+  glowA.width = Math.max(1, W >> 2); glowA.height = Math.max(1, H >> 2);
+  glowB.width = Math.max(1, W >> 3); glowB.height = Math.max(1, H >> 3);
+  U = Math.min(W, H * 0.8) / 1000;      // 1U = 画面基准单位
+  CX = W / 2;
+  GY = H * 0.8;                         // 地面高度
+}
+addEventListener('resize', resize);
+resize();
+
+// ===== 工具 =====
+// 默认每次打开都随机；网址加 ?seed=数字 可以固定成同一朵花（截图对比用）
+const SEED = new URLSearchParams(location.search).get('seed');
+const R = SEED === null ? Math.random : (() => {
+  let x = (parseInt(SEED, 10) || 1) >>> 0;
+  return () => { x = (x + 0x6D2B79F5) >>> 0; let t = Math.imul(x ^ (x >>> 15), 1 | x);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+})();
+const TAU = Math.PI * 2;
+const R2 = SEED === null ? Math.random : (() => { let i = parseInt(SEED, 10) || 0; return () => { const x = Math.sin(++i * 12.9898 + 78.233) * 43758.5453; return x - Math.floor(x); }; })();
+const gauss = () => {
+  let u = 0, v = 0;
+  while (!u) u = R(); while (!v) v = R();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * v);
+};
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const ss = (a, b, x) => { x = clamp((x - a) / (b - a), 0, 1); return x * x * (3 - 2 * x); };
+const lerp = (a, b, t) => a + (b - a) * t;
+// 抬头用的：从静止慢慢起步、平滑加速、再慢慢停下（起止速度都是 0，不会像被甩起来，也不会突然刹住）
+const soft = (a, b, x) => { x = clamp((x - a) / (b - a), 0, 1); return 0.5 - 0.5 * Math.cos(Math.PI * x); };
+const mix = (c1, c2, t) => [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
+// 每个粒子都带：出现阈值 k、闪烁相位 ph、闪烁速度 tw、尺寸 sz
+const P = o => Object.assign(o, { k: R(), ph: R() * TAU, tw: 0.6 + R() * 2.2, sz: 0.6 + R() * 0.9 });
+
+// ===== 形状定义 =====
+// 蓝紫彼岸花：一根光秃秃的花葶（花叶不相见），顶上一圈 6 朵小花几乎水平朝外开；
+// 每朵 6 片丝带状的瓣起皱、向后卷，7 根花蕊顺着花瓣的方向长长地伸出去，末端像睫毛一样往上翘
+// 花头是立体的（会慢慢转），花头里的长度单位乘 FL_UNIT 才是画面上的 U
+const FL_UNIT = 188;                                 // 比之前放大 25%（含花蕊）
+const NF = 5 + (R() < .5 ? 1 : 0);                   // 真实彼岸花一个花头 4–7 朵小花
+// 朝向打散：一两朵稍微朝上，其余有的平、有的略往下，避免左右对称成一只蝴蝶
+const ELS = [1.25, 1.3, 1.35, 1.4, 1.45, 1.5].sort(() => R() - .5);   // 朝向接近水平、略微朝上，差异小：一圈花蕊才能兜成一个「碗」托住花心
+const FLORETS = Array.from({ length: NF }, (_, i) => ({
+  az: i / NF * TAU + (R() - .5) * .25,               // 朝哪个方向：一圈大致均匀分布，只略有错落
+  el: ELS[i] + (R() - .5) * .08,                     // 离开竖直方向多少（≈1.57 是水平）
+  lift: R() * .03, close: R() * .04,                 // 收缩时晚多久合上：每朵不同步
+  u: [0, 0, 0], a: [0, 1, 0], v: [0, 0, 0],          // 每帧算出来的小花坐标轴
+  // 6 片狭长花被片：先斜着伸出去，再向后反卷成一个小卷
+  // 细长花被片：前半段较舒展，主要在中后段逐渐向后反卷成开放的弧线（不卷成圈）；长度、方向、弯曲各片不同
+  tep: Array.from({ length: 6 }, (_, j) => ({ phi: j / 6 * TAU + (R() - .5) * .35, len: 0.82 * (.85 + R() * .3),
+                                              th: .2 + R() * .18, curl: 2.4 + R() * .6, pw: 1.3 + R2() * .4, hook: 1.0 + R2() * .5 })),   // 根部收拢；出来不远就开始往后翻卷，末端卷成一个小圈（总共翻过 230°–290°，不闭合成整圈）
+  // 6 根花蕊成一束：从花喉几乎平行地出发，根部放平、略微朝下，然后整根一起向上扬起 70°–100°，末端才稍微散开
+  // （真彼岸花的花蕊几乎全都向上弯，一圈合起来像一个碗托住花心）；同一束里有一两根特别长，其余长短不一。只有少数花药是亮点
+  st: Array.from({ length: 6 }, (_, j) => {
+    const long = j < 2;
+    return { phi: R() * TAU, ty: 0, long,
+             sp: .1 + R() * .35,
+             len: long ? 1.9 + R() * .3 : 1.3 + R() * .6,      // 真花的花蕊是花瓣的 2–3 倍长
+             bend: (long ? 1.45 : 1.25) + R() * .3,     // 整根一共向上弯多少（弧度，约 70°–100°）
+             da: (j / 5 - .5) * .32 + (R() - .5) * .06,   // 在这一束里偏左还是偏右（成束、但不完全重叠）
+             dp: .06 + R() * .1,                        // 根部略微朝下多少
+             lat: (R2() - .5) * .5, ph2: R2() * TAU,      // 末端往侧边散开一点；呼吸相位（用另一串随机数，不打乱同一个 seed 下原来的花形）
+             hot: R() < (long ? .6 : .2),
+             wl: (.5 + R() * .45) / 1.5, ws: .2 + R() * .5, wg: .3 + R() * .5 };   // w*：低垂时的长度（花蕊加长后按比例缩回，保持原来的低垂姿态）、散开、下坠，各根不同
+  }),
+}));
+// 复苏的动作分开控制（单位：秒）：花头抬起 → 小花转向 → 花瓣逐朵舒展 → 花蕊稍晚慢慢伸展 → 稳定盛放 → 收拢
+// 小花舒展的顺序：先一侧、再另一侧、最后中间几朵（按花冠转好后在画面上的左右来排），相邻两朵开始间隔 0.3–0.4 秒，动作可以重叠
+let CLOSE_T = 0;                                     // 开始收拢的时刻：最后几根花蕊伸展到位后，再稳定盛放 1.1 秒
+{
+  const psi0 = 0.52, byX = FLORETS.map((fl, i) => [Math.sin(fl.el) * (Math.cos(fl.az) * Math.cos(psi0) + Math.sin(fl.az) * Math.sin(psi0)), i])
+    .sort((a, b) => a[0] - b[0]).map(x => x[1]);
+  let sideA = byX.slice(0, 2), sideB = byX.slice(-2).reverse(), mid = byX.slice(2, -2).sort(() => R() - .5);
+  if (R() < .5) [sideA, sideB] = [sideB, sideA];
+  let at = 1.5;                                     // 花头刚开始抬起就开始舒展，抬头和绽放连成一个动作
+  [...sideA, ...sideB, ...mid].forEach((fi, n) => {
+    const fl = FLORETS[fi];
+    fl.turn = 1.45 + fl.lift * 10;                  // 小花转向：跟着花头抬起，但比花头晚一点开始、慢一点结束
+    fl.open = at; fl.openD = 1.0 + R() * .2;        // 花瓣舒展：开始时刻、用时 1.0–1.2 秒
+    const s0 = at + .3 + R() * .2, sD = 1.4 + R() * .3;   // 花蕊比花瓣晚 0.3–0.5 秒，每根伸展 1.3–1.8 秒
+    fl.st.forEach(sd => {
+      sd.s0 = s0 + R() * .12;                       // 同一朵里各根花蕊只差一点点
+      sd.D = sD + (R() - .5) * .2;
+      sd.bounce = n >= NF - 2 && R() < .45 ? .045 + R() * .015 : 0;   // 最后两朵里少数几根末端轻轻伸过头 3%–5% 再回落
+      CLOSE_T = Math.max(CLOSE_T, sd.s0 + sd.D * (sd.bounce ? 1.25 : 1) + 1.1);
+    });
+    at += .3 + R() * .1;
+  });
+}
+CYCLE = CLOSE_T + 5.3;                               // 收拢、倒着长回土里的过程保持原来的 5.3 秒
+const SPINE = 16;                                    // 每片花瓣的中线分 16 段来算卷曲
+const spines = new Float32Array(NF * 6 * (SPINE + 1) * 6);   // 每段：位置 xyz + 横向 xyz
+const SN = 22;                                       // 每根花蕊的中线分 22 段
+const CAM = [-Math.sin(0.52), 0, Math.cos(0.52)];    // 花头坐标里「朝向镜头」的水平方向（花冠水平偏转约 30°）
+const stamSp = new Float32Array(NF * 7 * (SN + 1) * 3);
+// 茎按「节」分段：倒放时上面的段先缩短，最下面一段最后才缩回土里
+const NODES = [0, .07, .10, .40, .48, 1];
+const SEG_GONE = [[.80, .96], [.74, .94], [.62, .92], [.58, .88], [.52, .90]];
+const STEM_LEN = 390;
+const SOIL_W = 425, SOIL_D = 113;      // 土壤半宽、厚度（U）
+const HALO_R = 206;                     // 生命之花小圆半径，外圈是它的 2 倍；要包住整朵花，包括花蕊
+
+// ===== 生成粒子 =====
+const headPts = [];                                  // pal：0–2 花瓣根→尖，3 花蕊，4 亮花药，5 花梗，6 普通花药
+FLORETS.forEach((fl, fi) => {
+  fl.tep.forEach((_, ti) => {
+    for (let j = 0; j < 190; j++) {
+      const e = R() < .5;
+      const r = Math.pow(R(), 0.7);
+      headPts.push(P({ kind: 0, f: fi, t: ti, r, b: e ? (R() < .5 ? -1 : 1) * (0.9 + R() * .1) : R() * 2 - 1,
+                       wv: R() * TAU, pal: r < .3 ? 0 : r < .7 ? 1 : 2 }));
+    }
+  });
+  fl.st.forEach((sd, si) => {
+    for (let j = 0; j < 70; j++) headPts.push(P({ kind: 1, f: fi, t: si, r: j / 69, pal: 3 }));   // 点排得密，连成一根细丝
+    const na = sd.hot ? 6 : 4;                        // 每根末端都有花药：少数是发光的亮点，其余是偏暗的小线头
+    for (let j = 0; j < na; j++) headPts.push(P({ kind: 1, f: fi, t: si, r: 1 + R() * .03, pal: sd.hot ? 4 : 6 }));
+  });
+  for (let j = 0; j < 40; j++) headPts.push(P({ kind: 2, f: fi, r: R(), pal: 5 }));
+});
+
+const stemPts = [];
+for (let j = 0; j < 1100; j++) stemPts.push(P({ s: R(), w: clamp(gauss() * 0.4, -1, 1) }));
+
+// 光环的每个点都记着自己从土里哪儿飞上来（g）、什么时候出发（t0）、什么时候散（t1）
+const groundSpot = () => { let x; do x = gauss() * 0.5; while (Math.abs(x) > 1); return [x * 425, 8 + R() * 70]; };
+const haloLife = () => ({ g: groundSpot(), up: R() < .1, t0: 0.08 + R() * 0.16, t1: 0.6 + R() * 0.12, swirl: (R() - .5) * 2 });
+const haloPts = [];
+for (let ci = 0; ci < 8; ci++) {                    // 0–6 小圆，7 外圈
+  const n = ci === 7 ? 380 : 150;
+  for (let j = 0; j < n; j++) haloPts.push(P({ ci, th: R() * TAU, jit: gauss() * 0.012, ...haloLife() }));
+}
+const sparkPts = [];
+for (let j = 0; j < 170; j++) {
+  const rr = Math.sqrt(R()) * 2.25, th = R() * TAU;
+  sparkPts.push(P({ x: Math.cos(th) * rr, y: Math.sin(th) * rr, ...haloLife() }));
+}
+
+const soilPts = [];
+for (let j = 0; j < 4200; j++) {
+  let x; do x = gauss() * 0.5; while (Math.abs(x) > 1); x *= SOIL_W;
+  const top = -18 * Math.exp(-((x / 250) ** 2)) + Math.sin(x * 0.04) * 5 + Math.sin(x * 0.14) * 2;
+  const depth = Math.pow(R(), 1.3) * SOIL_D * Math.sqrt(Math.max(0, 1 - (x / (SOIL_W * 1.03)) ** 2));
+  soilPts.push(P({ x, y: 4 + top + depth, br: R() < 0.05 ? 0.9 : 0.15 + R() * 0.3 }));
+}
+
+const starPts = [];
+for (let j = 0; j < 210; j++) {                    // 比原来多约 30%：九成是暗淡的微小光点，只有少数稍亮、稍大
+  const hi = R() < .1;
+  const s = P({ x: R(), y: R(), v: 0.004 + R() * 0.01, br: hi ? .55 + R() * .2 : .16 + R() * .16 });
+  s.sz = hi ? .9 + R() * .5 : .45 + R() * .45;
+  starPts.push(s);
+}
+
+// ===== 画点 =====
+function dot(x, y, c, a, s) {
+  if (a < 0.008) return;
+  ctx.fillStyle = `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${Math.round(a * 1000) / 1000})`;
+  ctx.fillRect(x - s / 2, y - s / 2, s, s);
+}
+
+// 立体花头：按远近分 8 层，远的暗、先画，近的亮、盖在上面
+const LEVELS = 8, HEAD_NP = 7;
+const headBuckets = Array.from({ length: LEVELS * HEAD_NP }, () => []);
+
+// ===== 每帧绘制 =====
+function draw(p, t, T) {                           // p：原 10 秒节奏下的进度；T：这一轮里的秒数
+  // —— 生命值：一个相位 p 推导出所有状态 ——
+  // 前半段「复苏」：花葶先挺直，耷拉的小花随后一朵朵抬起来朝外张开；颜色从根部往上一路染成蓝紫
+  // 后半段「生长倒放」：小花一朵朵合拢、转回朝上聚成一簇花苞 → 花葶从上往下缩短 → 最后弯成钩缩回土里
+  const fade = ss(0, 0.05, p);                      // 开头从点里聚出来
+  const wS = 1 - soft(0.10, 0.34, p);               // 茎的枯萎弯曲（1 = 全枯）：约 2.4 秒从静止慢慢挺直
+  const wH = 1 - soft(0.145, 0.34, p);              // 花头比茎晚半拍才开始抬，像被茎慢慢带起来，最后和茎一起轻轻停住
+  const wave = h => ss(0.12 + 0.06 * h, 0.17 + 0.06 * h, p);  // 颜色波：h=0 根部，h=1 花头
+  const segLen = SEG_GONE.map(([a, b], i) => (NODES[i + 1] - NODES[i]) * lerp(0.03, 1, 1 - ss(a, b, p)));
+  const stemG = segLen.reduce((a, b) => a + b, 0);  // 茎现在的总长（1 = 长满）
+  const along = u => {                              // 茎上原来的位置 u → 现在的位置
+    let acc = 0;
+    for (let i = 0; i < segLen.length; i++) {
+      if (u <= NODES[i + 1]) return (acc + (u - NODES[i]) / (NODES[i + 1] - NODES[i]) * segLen[i]) / stemG;
+      acc += segLen[i];
+    }
+    return 1;
+  };
+  const hook = 1 - ss(0.04, 0.4, stemG);            // 茎很短时顶端弯成钩，像刚破土的芽
+  const Hs = STEM_LEN * U * stemG;
+  const shrink = lerp(1, 0.336, ss(0.5, 0.76, p)) * Math.pow(ss(0.22, 0.6, stemG), 0.7);   // 收拢时花头变小；茎短到一定程度花头就收没，最后只剩芽
+  const haloHead = shrink * lerp(1, 0.52, wH);       // 光环仍按原来的节奏跟着花头抬起长大
+  const opMean = FLORETS.reduce((a, fl) => a + ss(fl.open, fl.open + fl.openD, T), 0) / NF;
+  const headSc = shrink * lerp(0.52, 1, 0.3 * (1 - wH) + 0.7 * opMean);   // 花头不在抬头时一下子胀大，而是随着小花舒展慢慢长到盛开的大小
+  const dens = Math.min(fade, ss(0.04, 0.12, stemG));   // 只在最后一下才隐去
+  const headDens = Math.min(dens, ss(0.26, 0.5, stemG));   // 花头比茎更早隐去
+  const budGreen = 1 - ss(0.35, 0.7, stemG);             // 花苞越小越接近茎的颜色，最后看起来就是芽尖
+  const bloom = wave(1);
+  
+  const haloS = lerp(0.55, 1, ss(0.12, 0.32, p)) * Math.max(0.12, haloHead) * lerp(1, 0.45, ss(0.48, 0.66, p));   // 光球跟着花头一起缩，小花合上时缩得更快
+  const pulse = 1 + 0.08 * Math.sin(t * 2.1) * bloom;
+  const S = 1.7 * DPR;                              // 点的基础尺寸
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+
+  // —— 星尘 ——
+  const starCY = GY - STEM_LEN * U;                 // 花头大致所在的高度
+  for (const s of starPts) {
+    const y = ((s.y - t * s.v) % 1 + 1) % 1;
+    const tw = Math.pow(0.5 + 0.5 * Math.sin(t * s.tw + s.ph), 2);
+    const dx = s.x * W - CX, dy = y * H - starCY, d = Math.sqrt(dx * dx + dy * dy * 1.4);
+    const calm = lerp(0.2, 1, ss(150 * U, 340 * U, d));   // 花周围留一圈暗区
+    dot(s.x * W, y * H, [200, 200, 255], s.br * tw * calm, s.sz * S);
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  // —— 土壤 ——
+  for (const s of soilPts) {
+    const tw = 0.75 + 0.25 * Math.sin(t * s.tw + s.ph);
+    dot(CX + s.x * U, GY + s.y * U, COLORS.soil, s.br * 0.55 * tw, s.sz * S * 0.9);
+  }
+
+  // —— 茎（二次贝塞尔，枯萎时拱成弯钩）——
+  const wind = Math.sin(t * 4.1) + 0.35 * Math.sin(t * 1.7 + 1);  // 主摆动 + 一点慢阵风
+  const sway = wind * 0.024 * Hs * bloom * (1 - wH) * (1 - wH);   // 抬到位以后才慢慢有风中摇曳，抬头过程中不叠加晃动
+  const P0x = CX, P0y = GY;
+  const lean = 0.03 * Hs;                           // 茎不是笔直的，略微歪一点
+  const P1x = CX + lerp(0, 0.08, wS) * Hs + sway * 0.4 + lean, P1y = GY + (lerp(-0.5, -1.3, wS) - hook * 0.15) * Hs;
+  const P2x = CX + (lerp(0, 0.5, wS) + hook * 0.55) * Hs + sway + lean * 0.5, P2y = GY + (lerp(-1, -0.82, wS) + hook * 0.75) * Hs;
+  const bez = s => {
+    const m = 1 - s;
+    return [m * m * P0x + 2 * m * s * P1x + s * s * P2x, m * m * P0y + 2 * m * s * P1y + s * s * P2y];
+  };
+  const tan = s => Math.atan2(2 * (1 - s) * (P1y - P0y) + 2 * s * (P2y - P1y),
+                              2 * (1 - s) * (P1x - P0x) + 2 * s * (P2x - P1x));
+  const stemW = 7 * U * lerp(0.35, 1, stemG);
+  for (const s of stemPts) {
+    if (s.k > dens) continue;
+    const sa = along(s.s), [x, y] = bez(sa), th = tan(sa) + Math.PI / 2;
+    const tw = 0.7 + 0.3 * Math.sin(t * s.tw + s.ph);
+    const cb = wave(s.s * 0.85);
+    dot(x + Math.cos(th) * s.w * stemW, y + Math.sin(th) * s.w * stemW, mix(COLORS.wiltStem, COLORS.stem, cb),
+        lerp(0.4, 0.8, cb) * tw * (1 - Math.abs(s.w) * 0.4), s.sz * S);
+  }
+
+  // —— 花头：方向跟着花葶顶端的切线走，枯萎时额外下垂 ——
+  const thH = tan(1) + wH * 0.75 + hook * 0.6 + Math.sin(t * 4.1 - 0.6) * 0.03 * bloom * (1 - wH) * (1 - wH);   // 花头比茎慢半拍
+  const ax = Math.cos(thH), ay = Math.sin(thH);   // 花轴方向（画面上）
+  const rx = -ay, ry = ax;                        // 画面上的「右」
+  const Hx = P2x, Hy = P2y;
+  const Sc = FL_UNIT * U * headSc;
+  const psi = 0.52 + Math.sin(t * 0.3) * 0.08, cps = Math.cos(psi), sps = Math.sin(psi);   // 三分之四视角：花冠水平偏转约 30°，只轻轻来回晃
+  const tilt = 0.33, ca = Math.cos(tilt), sa = Math.sin(tilt);      // 轻微俯视约 19°
+  const persp = 0.2 * (1 - wH);                     // 近大远小（低垂时不加，保持原来的姿态）
+  // 每朵小花的状态：wF 枯萎度、cl 还没合上的程度、v 张开度
+  const st = FLORETS.map(fl => {
+    const wF = 1 - soft(fl.turn, fl.turn + 2.0, T);  // 小花从垂着的一束转成朝外：缓起缓停，只略微松开，不直接展开
+    const cl = 1 - ss(0.47 + fl.close, 0.64 + fl.close, p);
+    const op = ss(fl.open, fl.open + fl.openD, T);   // 这朵小花的花瓣舒展进度：抬头之后才轮到它，缓起缓停
+    const V = o => cl * lerp(lerp(0.42, 1, o), 0.6, wF);   // 张开度：0.42 是抬头后略微松开、还没展开的样子
+    const v = V(op);
+    const e = lerp(lerp(fl.el * 0.72, lerp(0.35, fl.el, cl), op), 0.3 + fl.el * 0.15, wF);   // 舒展时往外摆开；合上时朝上聚成一簇；枯萎时顺着朝下的花头并拢成一束
+    const a = fl.a, u = fl.u, w = fl.v;
+    u[0] = -Math.sin(fl.az); u[1] = 0; u[2] = Math.cos(fl.az);
+    a[0] = Math.sin(e) * Math.cos(fl.az); a[1] = Math.cos(e); a[2] = Math.sin(e) * Math.sin(fl.az);
+    w[0] = a[1] * u[2] - a[2] * u[1]; w[1] = a[2] * u[0] - a[0] * u[2]; w[2] = a[0] * u[1] - a[1] * u[0];
+    return { wF, v, cl, op, V, pl: 0.2 * lerp(0.4, 1, v) };   // 花梗短：小花都挤在花心附近，花瓣聚成一团
+  });
+  FLORETS.forEach((fl, fi) => {
+    const fs = st[fi], v = fs.v;
+    fl.tep.forEach((tp, ti) => {
+      const th = lerp(0.06, tp.th, v), curl = tp.curl * v * lerp(1, 0.35, fs.wF);   // 枯萎时卷不起来、软塌
+      const len = tp.len * lerp(0.75, 1, v) * lerp(1, 0.8, fs.wF), ds = len / SPINE;   // 枯萎时花瓣不跟着变长
+      const phi = tp.phi + Math.sin(t * 3 + fi + ti) * 0.04 * v * bloom;
+      const cp = Math.cos(phi), sp = Math.sin(phi);
+      let x = 0, y = 0, z = 0, base = ((fi * 6 + ti) * (SPINE + 1)) * 6;
+      for (let k = 0; k <= SPINE; k++) {
+        const r = k / SPINE, vr = fs.V(clamp(fs.op * 1.5 - r * 0.5, 0, 1));   // 从内向外舒展：靠根部的先打开，卷曲的末端最后缓缓翻开
+        const a = th + (curl * Math.pow(r, tp.pw) + tp.hook * lerp(1, 0.35, fs.wF) * ss(0.7, 1, r)) * (vr / Math.max(v, 1e-3)), tw = 1.3 * r * v;   // 前半段舒展，中后段往后反卷，末端翻成小钩，顺带扭一点
+        const nx = -Math.cos(a) * cp, ny = Math.sin(a), nz = -Math.cos(a) * sp;      // 中线所在平面里的法向
+        spines[base] = x; spines[base + 1] = y; spines[base + 2] = z;
+        spines[base + 3] = -sp * Math.cos(tw) + nx * Math.sin(tw);
+        spines[base + 4] = ny * Math.sin(tw);
+        spines[base + 5] = cp * Math.cos(tw) + nz * Math.sin(tw);
+        x += Math.sin(a) * cp * ds; y += Math.cos(a) * ds; z += Math.sin(a) * sp * ds;
+        base += 6;
+      }
+    });
+  });
+  // —— 花蕊：每根是一条连续的细丝。低垂时并拢、软软垂着；轮到它时从低垂的长度慢慢伸到全长，
+  //      同时散开、由根到梢逐渐弯出弧度，末端最后到位并上翘。所有粒子始终都在这条线上，不靠显示/隐藏制造生长 ——
+  FLORETS.forEach((fl, fi) => {
+    const fs = st[fi], v = fs.v;
+    fl.st.forEach((sd, si) => {
+      const x0 = (T - sd.s0) / sd.D;
+      const g = (1 + sd.bounce) * ss(0, 1, x0) - sd.bounce * ss(0.85, 1.25, x0);   // 缓慢启动、中段平稳、逐渐减速；少数末端轻轻伸过头再柔和回落
+      const gc = Math.min(1, g);
+      sd.g = gc;
+      sd.Lf = (lerp(sd.wl, 1, gc) + Math.max(0, g - 1)) * lerp(0.25, 1, fs.cl * fs.cl);   // 现在的长度（合上时整根缩回去）
+      // 低垂 / 合拢时：顺着小花的轴并拢成一束（和原来一样）
+      const spr = sd.sp * sd.ws, c1 = Math.cos(sd.phi) * spr, c2 = Math.sin(sd.phi) * spr;
+      let dx = c1 * fl.u[0] + fl.a[0] + c2 * fl.v[0], dy = c1 * fl.u[1] + fl.a[1] + c2 * fl.v[1], dz = c1 * fl.u[2] + fl.a[2] + c2 * fl.v[2];
+      let n = Math.hypot(dx, dy, dz); dx /= n; dy /= n; dz /= n;
+      // 盛开时：沿这朵小花朝外的水平方向出发，根部略微朝下；同一束里只左右错开一点
+      // 朝镜头那几束根部不往下压、略微抬起，并且更早往上弯：从花瓣团前面直接向上扬，不在花头下面兜成圈
+      const az = fl.az + sd.da, face = Math.max(0, Math.cos(az) * CAM[0] + Math.sin(az) * CAM[2]);
+      const dp = lerp(sd.dp, -0.12, face), cp = Math.cos(dp);
+      sd.pw = lerp(2.2, 1.4, face);
+      const m = gc * fs.cl;                           // 舒展到位、还没合上时才用盛开的出发方向
+      dx = lerp(dx, Math.cos(az) * cp, m); dy = lerp(dy, -Math.sin(dp), m); dz = lerp(dz, Math.sin(az) * cp, m);
+      const n2 = Math.hypot(dx, dy, dz); dx /= n2; dy /= n2; dz /= n2;
+      const step = sd.Lf * 1.04 / SN * lerp(n, 1, gc);   // 每段长度（低垂时和原来并拢的那一束一样长）
+      // 往上弯，末端再往侧边散开一点
+      n = Math.hypot(dx, dz) || 1;
+      let bx = -dz / n * sd.lat, by = 1, bz = dx / n * sd.lat;
+      const dot0 = bx * dx + by * dy + bz * dz;
+      bx -= dot0 * dx; by -= dot0 * dy; bz -= dot0 * dz;
+      n = Math.hypot(bx, by, bz) || 1; bx /= n; by /= n; bz /= n;
+      const TH = sd.bend * v * (1 + 0.03 * Math.sin(t * 1.1 + sd.ph2));   // 盛放后保留一点很轻的呼吸
+      let x = 0, y = 0, z = 0, base = (fi * 7 + si) * (SN + 1) * 3;
+      for (let k = 0; k <= SN; k++) {
+        stamSp[base] = x; stamSp[base + 1] = y; stamSp[base + 2] = z; base += 3;
+        const w = (k + 0.5) / SN * 1.04;            // 在这根花蕊上的位置（0 根部，1 末端）
+        const done = ss(0, 1, gc * 1.4 - w * 0.4);  // 由根到梢逐渐弯出来：中段先舒展，末端最后到位
+        const th = TH * Math.pow(w, sd.pw) * done;  // 弯曲集中在外半段：先长长地往外伸，再向上扬起，末端翘起
+        const c = Math.cos(th), sn = Math.sin(th);
+        x += (c * dx + sn * bx) * step; y += (c * dy + sn * by) * step; z += (c * dz + sn * bz) * step;
+      }
+    });
+  });
+  // 这一帧的花头配色（枯萎灰紫 → 盛开蓝紫），再按远近做出 8 档明暗
+  const hp = [...COLORS.petal.map(c => mix(COLORS.wiltPetal, c, bloom)),
+              mix(COLORS.wiltStamen, COLORS.stamen, bloom), mix(COLORS.wiltStamen, COLORS.anther, bloom),
+              mix(COLORS.wiltStem, COLORS.stem, bloom), mix(COLORS.wiltStamen, COLORS.antherDim, bloom)].map(c => mix(c, COLORS.stem, budGreen));
+  for (const b of headBuckets) b.length = 0;
+  const o = [0, 0, 0], q = [0, 0, 0];
+  for (const s of headPts) {
+    if (s.k > headDens) continue;
+    const fl = FLORETS[s.f], fs = st[s.f], v = fs.v;
+    const cx = fl.a[0] * fs.pl, cy = fl.a[1] * fs.pl, cz = fl.a[2] * fs.pl;
+    if (s.kind === 2) { q[0] = cx * s.r; q[1] = cy * s.r; q[2] = cz * s.r; }
+    else {
+      if (s.kind === 0) {
+        const f = s.r * SPINE, k = Math.min(SPINE - 1, f | 0), u = f - k;
+        const b0 = ((s.f * 6 + s.t) * (SPINE + 1) + k) * 6, b1 = b0 + 6;
+        const hw = 0.065 * Math.min(1, s.r * 4) * Math.pow(1 - s.r, 0.7) * (1 + 0.32 * Math.sin(s.r * 26 + s.wv) * v);  // 丝带：根部细，往末端慢慢收窄，边缘起皱
+        for (let c = 0; c < 3; c++)
+          o[c] = lerp(spines[b0 + c], spines[b1 + c], u) + lerp(spines[b0 + 3 + c], spines[b1 + 3 + c], u) * (Math.abs(s.b) > .89 && s.wv < 1.9 ? s.b * .55 : s.b) * hw;   // 边缘的点少一些，减少描边感
+      } else {
+        // 花蕊：粒子均匀地排在这根细丝上，跟着它一起伸长、弯曲
+        const uq = Math.min(s.r, 1.03) / 1.04 * SN, k = Math.min(SN - 1, uq | 0), f = uq - k;
+        const b0 = ((s.f * 7 + s.t) * (SN + 1) + k) * 3;
+        for (let c = 0; c < 3; c++) q[c] = fl.st[s.t].len * lerp(stamSp[b0 + c], stamSp[b0 + 3 + c], f);
+      }
+      if (s.kind === 0) {
+        q[0] = o[0] * fl.u[0] + o[1] * fl.a[0] + o[2] * fl.v[0];
+        q[1] = o[0] * fl.u[1] + o[1] * fl.a[1] + o[2] * fl.v[1];
+        q[2] = o[0] * fl.u[2] + o[1] * fl.a[2] + o[2] * fl.v[2];
+      }
+      q[0] += cx; q[1] += cy; q[2] += cz;
+    }
+    let sag = 0;                                    // 枯萎时按画面上的重力往下坠
+    if (s.kind === 1) {
+      const sd = fl.st[s.t], rr = Math.min(s.r, 1);
+      sag = (fs.wF + (1 - fs.wF) * 0.4 * (1 - sd.g)) * sd.wg * rr * rr * sd.len;   // 还没舒展的花蕊仍软软地垂着一点，舒展时慢慢托起来
+    } else if (s.kind === 0) sag = fs.wF * 0.35 * s.r * s.r;
+    const x1 = q[0] * cps + q[2] * sps, z1 = -q[0] * sps + q[2] * cps;
+    const y2 = q[1] * ca - z1 * sa, z2 = q[1] * sa + z1 * ca;
+    const l = clamp(Math.floor((z2 + 1.4) / 2.8 * LEVELS), 0, LEVELS - 1);
+    const pk = 1 / (1 - clamp(z2, -1.6, 1.6) * persp);   // 近大远小：花心在原点，所以花头始终接在茎顶
+    headBuckets[l * HEAD_NP + s.pal].push(Hx + (x1 * rx + y2 * ax) * Sc * pk, Hy + (x1 * ry + y2 * ay) * Sc * pk + sag * Sc);
+  }
+  const hs = 1.5 * DPR;
+  for (let i = 0; i < headBuckets.length; i++) {
+    const b = headBuckets[i];
+    if (!b.length) continue;
+    const l = Math.floor(i / HEAD_NP), c = hp[i % HEAD_NP], m = lerp(0.45 + 0.55 * l / (LEVELS - 1), lerp(0.34, 1.06, l / (LEVELS - 1)), bloom) * pulse;   // 盛开时远处的小花更暗、近处略亮
+    const ps = hs * lerp(1, lerp(0.85, 1.15, l / (LEVELS - 1)), bloom) * (i % HEAD_NP === 3 ? 0.8 : 1);   // 近处的点略大、更清晰；花蕊的点小一些，像细丝
+    ctx.fillStyle = `rgba(${Math.min(255, c[0] * m) | 0},${Math.min(255, c[1] * m) | 0},${Math.min(255, c[2] * m) | 0},${lerp(0.6, 0.8, bloom)})`;
+    ctx.beginPath();
+    for (let j = 0; j < b.length; j += 2) ctx.rect(b[j] - ps / 2, b[j + 1] - ps / 2, ps, ps);
+    ctx.fill();
+  }
+
+  ctx.globalCompositeOperation = 'lighter';
+  // —— 生命之花光球：点从土里飞上来聚成光环；收缩时一边变暗、一边稀疏、一边落回地面 ——
+  {
+    const hcx = Hx + ax * 50 * U * haloHead, hcy = Hy + ay * 50 * U * haloHead;     // 圆心在花头中间，整朵花连花蕊都包在里面
+    const rr = HALO_R * U * haloS;
+    const rot = t * 0.12;
+    const thin = Math.min(1, haloS);                // 光环缩小时点会挤在一起，按比例减淡，免得越缩越亮
+    const fly = (s, tx, ty, base, spark) => {
+      const a = ss(s.t0, s.t0 + 0.12, p), d = ss(s.t1, s.t1 + 0.12, p);
+      if (a <= 0 || d >= 1 || s.k > thin + 0.15) return;
+      const gx = CX + s.g[0] * U, gy = GY + s.g[1] * U;
+      const de = d * d;                             // 散的时候往地上落
+      const at = aa => {                            // 飞行进度 aa 时的位置：从地面沿一道弧线飞到光环上
+        if (!s.up) return [tx, ty];
+        const e = 1 - (1 - aa) ** 3;
+        return [lerp(gx, tx, e) + Math.sin(aa * Math.PI) * s.swirl * 60 * U, lerp(gy, ty, e)];
+      };
+      let [x, y] = at(a);
+      x = lerp(x, gx, de * 0.7); y = lerp(y, gy, de * 0.7);
+      const tw = Math.pow(0.5 + 0.5 * Math.sin(t * s.tw + s.ph), 1.5);
+      const flying = s.up && a < 1;
+      const al = base * (s.up ? 1 : a) * (1 - d) * thin * fade * (flying ? 1 : tw);
+      dot(x, y, flying || spark ? COLORS.haloSpark : COLORS.halo, al * (flying ? 1.15 : 1), s.sz * S * (flying ? 1.1 : 0.9));
+      if (flying) for (let k = 1; k <= 3; k++) {    // 飞的时候拖一条短尾巴
+        const [qx, qy] = at(Math.max(0, a - k * 0.035));
+        dot(qx, qy, COLORS.halo, al * (1 - k * 0.28), s.sz * S * 0.8);
+      }
+    };
+    for (const s of haloPts) {
+      let cx = hcx, cy = hcy, rad = rr;
+      if (s.ci > 0 && s.ci < 7) {
+        const a = (s.ci - 1) * TAU / 6 + rot;
+        cx += Math.cos(a) * rr; cy += Math.sin(a) * rr;
+      } else if (s.ci === 7) rad = rr * 2;
+      const th = s.th + rot * (s.ci === 7 ? 0.5 : 1), r2 = rad * (1 + s.jit);
+      fly(s, cx + Math.cos(th) * r2, cy + Math.sin(th) * r2, s.ci === 7 ? 0.75 : 0.5);
+    }
+    for (const s of sparkPts) {
+      const tw = Math.pow(0.5 + 0.5 * Math.sin(t * s.tw * 1.6 + s.ph), 3);
+      fly(s, hcx + s.x * rr, hcy + s.y * rr, 0.7 * tw, true);
+    }
+  }
+
+  // —— 辉光：缩小再放大回来叠加，便宜的 bloom ——
+  ctx.globalCompositeOperation = 'source-over';
+  gA.clearRect(0, 0, glowA.width, glowA.height);
+  gA.drawImage(cv, 0, 0, glowA.width, glowA.height);
+  gB.clearRect(0, 0, glowB.width, glowB.height);
+  gB.drawImage(glowA, 0, 0, glowB.width, glowB.height);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.imageSmoothingEnabled = true;
+  ctx.globalAlpha = 0.45; ctx.drawImage(glowA, 0, 0, W, H);
+  ctx.globalAlpha = 0.5;  ctx.drawImage(glowB, 0, 0, W, H);
+  ctx.globalAlpha = 1;
+}
+
+// ===== 时间与调试 =====
+const params = new URLSearchParams(location.search);
+const fixedT = params.has('t') ? parseFloat(params.get('t')) : null;   // 截图对比用：定格到某个时间
+const frozen = params.has('p') ? clamp(parseFloat(params.get('p')) || 0, 0, 0.999) : null;
+const atT = params.has('T') ? parseFloat(params.get('T')) : null;   // 截图用：?T=秒 定格到这一轮的第几秒
+let sim = atT ?? (frozen ?? 0) * CYCLE, paused = frozen !== null || atT !== null, last = performance.now();
+const panel = document.getElementById('panel'), scrub = document.getElementById('scrub'), lbl = document.getElementById('lbl');
+
+addEventListener('keydown', e => {
+  if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
+  if (e.key === 'd' || e.key === 'D') panel.classList.toggle('on');
+});
+scrub.addEventListener('input', () => { sim = parseFloat(scrub.value) * CYCLE; });
+
+// 秒 → 原 10 秒节奏下的进度：前面照原节奏走，到 4.7 秒停住等花瓣花蕊舒展完、盛放 1.1 秒，再接上收拢和倒着长回土里
+const phase = T => T < CLOSE_T ? Math.min(T / 10, 0.47) : 0.47 + (T - CLOSE_T) / 10;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (!paused) sim += dt;
+  const p = (sim / CYCLE) % 1;
+  draw(phase(p * CYCLE), fixedT ?? now / 1000, p * CYCLE);
+  scrub.value = p; lbl.textContent = p.toFixed(2);
+  requestAnimationFrame(frame);
+}
+frame(performance.now());
+</script>
+</body>
+</html>
